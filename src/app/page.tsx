@@ -9,31 +9,10 @@ type Evidence = { filename: string; chunk_index: number; content: string };
 type DocRow = {
   id: number;
   filename: string;
-  mime_type: string | null;
-  size_bytes: number | null;
+  mime_type?: string | null;
+  size_bytes?: number | null;
+  ocr_status?: string | null;
 };
-
-async function extractPdfTextInBrowser(file: File) {
-  const pdfjs: any = await import('pdfjs-dist/legacy/build/pdf');
-
-  const data = new Uint8Array(await file.arrayBuffer());
-
-  // Disable worker to avoid worker bundling issues in Next
-  const loadingTask = pdfjs.getDocument({ data, disableWorker: true });
-  const pdf = await loadingTask.promise;
-
-  let out = '';
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent();
-    const strings = content.items
-      .map((it: any) => (typeof it.str === 'string' ? it.str : ''))
-      .join(' ');
-    out += strings + '\n';
-  }
-
-  return out.trim();
-}
 
 function messageText(m: any) {
   return (m.parts || [])
@@ -45,18 +24,16 @@ function messageText(m: any) {
 function splitAnswerAndSources(full: string) {
   const idx = full.toLowerCase().lastIndexOf('\nsources:');
   if (idx === -1) return { answer: full, sourcesBlock: '' };
-  return {
-    answer: full.slice(0, idx).trimEnd(),
-    sourcesBlock: full.slice(idx).trim(),
-  };
+  return { answer: full.slice(0, idx).trimEnd(), sourcesBlock: full.slice(idx).trim() };
 }
 
+// Parses lines like:
+// - S1: doc_id=123 file=AI-test.txt chunk=0
 function parseSources(sourcesBlock: string): Record<string, SourceRef> {
   const map: Record<string, SourceRef> = {};
   const lines = sourcesBlock.split('\n');
 
   for (const line of lines) {
-    // New strict format: - S1: doc_id=123 file=AI-test.txt chunk=0
     let m = line.match(/S(\d+)\s*:\s*doc_id=(\d+).*?chunk=(\d+)/i);
     if (m) {
       const tag = `S${m[1]}`;
@@ -66,12 +43,11 @@ function parseSources(sourcesBlock: string): Record<string, SourceRef> {
       continue;
     }
 
-    // Old format: - S1: AI-test.txt, 0
+    // Old format: "- S1: AI-test.txt, 0"
     m = line.match(/S(\d+)\s*:\s*([^,]+),\s*(\d+)/i);
     if (m) {
       const tag = `S${m[1]}`;
       map[tag] = { chunk: Number(m[3]), file: m[2].trim() };
-      continue;
     }
   }
 
@@ -84,7 +60,6 @@ function renderWithCitations(text: string, onClick: (tag: string) => void) {
     const m = p.match(/^\[(S\d+)\]$/);
     if (!m) return <span key={i}>{p}</span>;
     const tag = m[1];
-
     return (
       <button
         key={i}
@@ -99,12 +74,17 @@ function renderWithCitations(text: string, onClick: (tag: string) => void) {
   });
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export default function Page() {
   const [input, setInput] = useState('');
   const [uploadStatus, setUploadStatus] = useState<string>('');
 
   const [docs, setDocs] = useState<DocRow[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
+
   const [previewUrl, setPreviewUrl] = useState<string>('');
   const [previewLoading, setPreviewLoading] = useState(false);
 
@@ -113,14 +93,18 @@ export default function Page() {
 
   const { messages, sendMessage, error, isLoading } = useChat();
 
+  const selectedDoc = docs.find((d) => d.id === selectedDocId) || null;
+
   async function refreshDocs(autoSelectId?: number) {
     const res = await fetch('/api/docs');
     const data = await res.json().catch(() => ({}));
     const list: DocRow[] = data.documents || [];
     setDocs(list);
 
-    if (autoSelectId && list.some((d) => d.id === autoSelectId)) {
-      await selectDoc(autoSelectId, list);
+    const pick = autoSelectId && list.some((d) => d.id === autoSelectId) ? autoSelectId : null;
+
+    if (pick) {
+      await selectDoc(pick, list);
     } else if (!selectedDocId && list.length > 0) {
       await selectDoc(list[0].id, list);
     }
@@ -136,9 +120,8 @@ export default function Page() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || 'Failed to get preview URL');
       setPreviewUrl(data.url || '');
-    } catch (e: any) {
+    } catch (e) {
       setPreviewUrl('');
-      console.error(e);
     } finally {
       setPreviewLoading(false);
     }
@@ -148,43 +131,6 @@ export default function Page() {
     refreshDocs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  async function uploadFile(file: File) {
-  setUploadStatus('Uploading + indexing...');
-
-  const fd = new FormData();
-  fd.append('file', file);
-
-  const filename = file.name.toLowerCase();
-  const isPdf = filename.endsWith('.pdf') || file.type === 'application/pdf';
-
-  if (isPdf) {
-    setUploadStatus('Extracting PDF text in browser...');
-    const extractedText = await extractPdfTextInBrowser(file);
-
-    if (!extractedText) {
-      setUploadStatus('Upload failed: This PDF has no extractable text (likely scanned).');
-      return;
-    }
-
-    fd.append('extractedText', extractedText);
-    setUploadStatus('Uploading + indexing...');
-  }
-
-  const res = await fetch('/api/docs/upload', { method: 'POST', body: fd });
-  const data = await res.json().catch(() => ({}));
-
-  if (!res.ok) {
-    setUploadStatus(
-      `Upload failed: ${data.detail ? `${data.error}: ${data.detail}` : data.error || res.statusText}`,
-    );
-    return;
-  }
-
-  setUploadStatus(`Indexed: ${file.name} (${data.chunks} chunks)`);
-  // if you have refreshDocs(data.documentId) in your page, keep it
-}
-
 
   const assistantSources = useMemo(() => {
     const out: Record<string, Record<string, SourceRef>> = {};
@@ -208,7 +154,7 @@ export default function Page() {
 
       setEvidenceLoading(true);
       try {
-        const hasDocId = Number.isFinite(ref.docId);
+        const hasDocId = typeof ref.docId === 'number' && Number.isFinite(ref.docId);
         const url = hasDocId
           ? `/api/source?docId=${ref.docId}&chunk=${ref.chunk}`
           : `/api/source?file=${encodeURIComponent(ref.file || '')}&chunk=${ref.chunk}`;
@@ -224,16 +170,78 @@ export default function Page() {
       }
       return;
     }
-
-    setEvidence({
-      tag,
-      filename: 'Error',
-      chunk_index: -1,
-      content: 'No source mapping found. Ask again to regenerate Sources.',
-    });
   }
 
-  const selectedDoc = docs.find((d) => d.id === selectedDocId) || null;
+  async function runOcr(docId: number) {
+    setUploadStatus('Starting OCR (Textract)…');
+
+    const startRes = await fetch(`/api/ocr/start?docId=${docId}`, { method: 'POST' });
+    const startData = await startRes.json().catch(() => ({}));
+    if (!startRes.ok) {
+      setUploadStatus(`OCR start failed: ${startData?.error || startRes.statusText}`);
+      return;
+    }
+
+    // poll until done
+    for (let i = 0; i < 200; i++) {
+      await sleep(2500);
+
+      const pollRes = await fetch(`/api/ocr/poll?docId=${docId}`, { method: 'POST' });
+      const pollData = await pollRes.json().catch(() => ({}));
+
+      if (!pollRes.ok) {
+        setUploadStatus(`OCR failed: ${pollData?.error || pollRes.statusText}`);
+        return;
+      }
+
+      if (pollData.status === 'RUNNING') {
+        setUploadStatus('OCR running…');
+        continue;
+      }
+
+      if (pollData.status === 'SUCCEEDED') {
+        setUploadStatus(`OCR complete. Indexed (${pollData.chunks} chunks).`);
+        await refreshDocs(docId);
+        return;
+      }
+
+      // unexpected
+      setUploadStatus(`OCR status: ${String(pollData.status)}`);
+    }
+
+    setUploadStatus('OCR timed out (took too long). Try again.');
+  }
+
+  async function uploadFile(file: File) {
+    setUploadStatus('Uploading…');
+
+    const fd = new FormData();
+    fd.append('file', file);
+
+    const res = await fetch('/api/docs/upload', { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      setUploadStatus(
+        `Upload failed: ${data.detail ? `${data.error}: ${data.detail}` : data.error || res.statusText}`,
+      );
+      return;
+    }
+
+    const docId = Number(data.documentId);
+
+    if (Number.isFinite(docId)) {
+      await refreshDocs(docId);
+    }
+
+    // If server says OCR is needed, run it
+    if (data.needsOcr && Number.isFinite(docId)) {
+      await runOcr(docId);
+      return;
+    }
+
+    setUploadStatus(`Indexed: ${file.name} (${data.chunks} chunks)`);
+  }
 
   return (
     <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -271,11 +279,22 @@ export default function Page() {
                   id {d.id}
                   {d.mime_type ? ` · ${d.mime_type}` : ''}
                   {typeof d.size_bytes === 'number' ? ` · ${Math.round(d.size_bytes / 1024)} KB` : ''}
+                  {d.ocr_status ? ` · OCR ${d.ocr_status}` : ''}
                 </div>
               </button>
             ))
           )}
         </div>
+
+        {selectedDocId ? (
+          <button
+            type="button"
+            onClick={() => runOcr(selectedDocId)}
+            className="mt-2 w-full border rounded px-3 py-2"
+          >
+            Run OCR for selected PDF
+          </button>
+        ) : null}
       </div>
 
       {/* MIDDLE: chat */}
@@ -350,6 +369,7 @@ export default function Page() {
       <div className="space-y-6">
         <div className="border rounded p-4 space-y-3">
           <div className="font-semibold">File preview</div>
+
           <div className="text-sm opacity-80">
             {selectedDoc ? (
               <>
@@ -364,22 +384,13 @@ export default function Page() {
           {previewLoading ? (
             <div className="text-sm opacity-70">Loading preview…</div>
           ) : previewUrl ? (
-            <iframe
-              src={previewUrl}
-              className="w-full h-[420px] border rounded"
-              title="File preview"
-            />
+            <iframe src={previewUrl} className="w-full h-[420px] border rounded" title="File preview" />
           ) : (
             <div className="text-sm opacity-70">No preview URL yet.</div>
           )}
 
           {previewUrl ? (
-            <a
-              className="underline underline-offset-4 text-sm"
-              href={previewUrl}
-              target="_blank"
-              rel="noreferrer"
-            >
+            <a className="underline underline-offset-4 text-sm" href={previewUrl} target="_blank" rel="noreferrer">
               Open in new tab
             </a>
           ) : null}
