@@ -5,6 +5,13 @@ import { dbQuery, toPgVector } from '@/lib/db';
 
 export const runtime = 'nodejs';
 
+type TopRow = {
+  document_id: number;
+  filename: string;
+  chunk_index: number;
+  content: string;
+};
+
 function lastUserText(messages: UIMessage[]) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -35,12 +42,7 @@ export async function POST(req: Request) {
       value: question,
     });
 
-    const top = await dbQuery<{
-      document_id: number;
-      filename: string;
-      chunk_index: number;
-      content: string;
-    }>(
+    const top = await dbQuery<TopRow>(
       `
       select d.id as document_id, d.filename, c.chunk_index, c.content
       from chunks c
@@ -51,11 +53,14 @@ export async function POST(req: Request) {
       [toPgVector(embedding)],
     );
 
-    const sourceIndex = top.rows.map((r, idx) => {
+    // Force correct row typing (prevents implicit-any in map on some TS configs)
+    const rows: TopRow[] = top.rows;
+
+    const sourceIndex = rows.map((r: TopRow, idx: number) => {
       return `- S${idx + 1}: doc_id=${r.document_id} file=${r.filename} chunk=${r.chunk_index}`;
     });
 
-    const sources = top.rows.map((r, idx) => {
+    const sources = rows.map((r: TopRow, idx: number) => {
       const tag = `S${idx + 1}`;
       const snippet = r.content.slice(0, 900);
       return `[${tag}] doc_id=${r.document_id} file=${r.filename} chunk=${r.chunk_index}\n${snippet}`;

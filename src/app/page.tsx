@@ -91,7 +91,8 @@ export default function Page() {
   const [evidence, setEvidence] = useState<(Evidence & { tag: string }) | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
 
-  const { messages, sendMessage, error, isLoading } = useChat();
+const { messages, sendMessage, error, status } = useChat();
+const isLoading = status === 'submitted' || status === 'streaming';
 
   const selectedDoc = docs.find((d) => d.id === selectedDocId) || null;
 
